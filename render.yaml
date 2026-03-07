@@ -11,7 +11,7 @@ services:
 
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11.0
+        value: 3.11.9
       - key: TF_CPP_MIN_LOG_LEVEL
         value: "3"             # Suppress TensorFlow noise in logs
 
