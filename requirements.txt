@@ -1,0 +1,28 @@
+# OracleAU — Python dependencies
+# Install with: pip install -r requirements.txt
+
+# API
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic==2.8.2
+
+# Data — Stooq via direct HTTP (no pandas_datareader, no yfinance)
+requests==2.32.3            # HTTP client for Stooq CSV endpoint
+pandas==2.2.2
+numpy==1.26.4
+
+# Technical indicators
+ta==0.11.0
+
+# ML
+scikit-learn==1.5.1
+xgboost==2.1.1
+joblib==1.4.2
+
+# Deep learning
+# Standard (Linux / Intel Mac):
+# tensorflow==2.17.0
+
+# Apple Silicon (M1/M2/M3):
+# tensorflow==2.17.0
+# tensorflow-metal==1.1.0
