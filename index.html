@@ -455,6 +455,53 @@
       .grid-2, .grid-3, .grid-4 { grid-template-columns: 1fr; }
       .header { flex-direction: column; align-items: flex-start; }
       .header-meta { align-items: flex-start; }
+
+      /* Wrapper padding tighter on mobile */
+      .wrapper { padding: 0 14px 40px; }
+      .panel   { padding: 14px 14px; }
+
+      /* Live price smaller on mobile */
+      .live-price-value { font-size: 22px; }
+
+      /* Forecast table — mobile layout */
+      /* Hide XGB/LSTM breakdown column — too wide on small screens */
+      .forecast-table .col-models { display: none; }
+
+      /* Tighter cell padding */
+      .forecast-table th { padding: 0 7px 10px; font-size: 8px; }
+      .forecast-table td { padding: 11px 7px; }
+
+      /* Merge Day + Date into one compact cell */
+      .td-day  { display: none; }
+      .td-date { color: var(--text-secondary); font-size: 11px; }
+
+      /* Smaller ensemble price */
+      .td-price { font-size: 13px; }
+
+      /* Change column — tighter */
+      .td-change { font-size: 11px; }
+
+      /* Confidence pill — compact */
+      .conf-pip { padding: 3px 6px; font-size: 9px; }
+
+      /* Forecast header stack */
+      .forecast-header { flex-direction: column; align-items: flex-start; gap: 8px; }
+      .forecast-meta   { font-size: 10px; }
+
+      /* Chart height smaller on mobile */
+      .chart-wrap { height: 160px; }
+
+      /* Period buttons smaller */
+      .period-btn { padding: 4px 7px; font-size: 10px; }
+
+      /* Accuracy table — hide error column on mobile */
+      .acc-col-error { display: none; }
+
+      /* Indicators grid — single column */
+      #indicators-grid { grid-template-columns: 1fr; }
+
+      /* Accuracy grid 2 cols on mobile */
+      .accuracy-grid { grid-template-columns: 1fr 1fr; }
     }
 
     /* ============================================================
@@ -843,7 +890,7 @@
             <th>Day</th>
             <th>Date</th>
             <th>Ensemble £</th>
-            <th>XGB / LSTM</th>
+            <th class="col-models">XGB / LSTM</th>
             <th>Change</th>
             <th>Confidence</th>
           </tr>
@@ -1016,7 +1063,7 @@
             <th>Date</th>
             <th>Predicted £</th>
             <th>Actual £</th>
-            <th>Error £</th>
+            <th class="acc-col-error">Error £</th>
             <th>Direction</th>
             <th>Result</th>
           </tr>
@@ -1216,7 +1263,7 @@ async function loadForecast() {
           <td class="td-day">Day ${row.day}</td>
           <td class="td-date">${fmtDate(row.date)}</td>
           <td class="td-price">£${fmt(row.ensemble, 4)}</td>
-          <td class="td-models">
+          <td class="td-models col-models">
             £${fmt(row.xgboost, 4)}<br>
             £${fmt(row.lstm, 4)}
           </td>
@@ -1461,7 +1508,7 @@ function renderAccuracy() {
         <td style="color:var(--text-secondary)">${fmtDate(row.date)}</td>
         <td style="text-align:right">£${fmt(row.predicted, 4)}</td>
         <td style="text-align:right;color:var(--text-primary)">£${fmt(row.actual, 4)}</td>
-        <td style="text-align:right" class="td-change ${errCls}">${err >= 0 ? '+' : ''}${fmt(err, 4)}</td>
+        <td style="text-align:right" class="td-change acc-col-error ${errCls}">${err >= 0 ? '+' : ''}${fmt(err, 4)}</td>
         <td style="text-align:right">
           <span style="color:${actDir === 'UP' ? 'var(--up)' : 'var(--down)'}">
             ${actDir === 'UP' ? '▲' : '▼'} ${actDir}
