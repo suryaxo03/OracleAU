@@ -10,6 +10,7 @@ pydantic==2.8.2
 requests==2.32.3            # HTTP client for Stooq CSV endpoint
 pandas==2.2.2
 numpy==1.26.4
+matplotlib==3.9.2
 
 # Technical indicators
 ta==0.11.0
