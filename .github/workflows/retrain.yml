@@ -1,0 +1,173 @@
+# ================================================================
+# OracleAU — Automated Weekly Retraining
+# ================================================================
+# Runs every Sunday at 02:00 UTC (off-market, before Monday open)
+# Can also be triggered manually via the GitHub Actions UI.
+#
+# What this does:
+#   1. Fetches fresh SGLN.L data from Stooq
+#   2. Retrains XGBoost v2 + LSTM v2 on the latest data
+#   3. Commits the new model files back to the repo
+#   4. Render detects the push and auto-redeploys the API
+#
+# Secrets required (repo Settings → Secrets → Actions):
+#   GH_PAT — Personal Access Token with Contents: Read & Write
+# ================================================================
+
+name: Weekly Retrain
+
+on:
+  # Every Sunday at 02:00 UTC
+  schedule:
+    - cron: '0 2 * * 0'
+
+  # Manual trigger — "Run workflow" button in GitHub Actions UI
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Reason for manual retrain (optional)'
+        required: false
+        default: 'Manual trigger'
+
+jobs:
+  retrain:
+    name: Retrain OracleAU Models
+    runs-on: ubuntu-latest
+    timeout-minutes: 60    # Kill if something hangs
+
+    steps:
+
+      # ── 1. Check out the repo ───────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT }}  # Needed to push back later
+          fetch-depth: 0                # Full history
+
+      # ── 2. Set up Python 3.11 ──────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11.9'
+          cache: 'pip'                  # Cache pip deps between runs
+
+      # ── 3. Install dependencies ─────────────────────────────────
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ── 4. Verify models directory exists ───────────────────────
+      - name: Check model files present
+        run: |
+          echo "=== Models directory ==="
+          ls -lh models/
+          echo "=== Data directory ==="
+          ls -lh data/ 2>/dev/null || echo "data/ not present yet — will be created"
+
+      # ── 5. Run data pipeline ─────────────────────────────────────
+      - name: Fetch fresh SGLN data
+        run: |
+          echo "Running data_pipeline.py..."
+          python data_pipeline.py
+        env:
+          TF_CPP_MIN_LOG_LEVEL: "3"
+
+      # ── 6. Verify data was fetched ───────────────────────────────
+      - name: Verify pipeline output
+        run: |
+          echo "=== Data files ==="
+          ls -lh data/
+          echo "=== Latest rows ==="
+          python -c "
+          import pandas as pd
+          df = pd.read_csv('data/SGLN_features.csv', index_col=0, parse_dates=True)
+          print(f'Rows: {len(df)}')
+          print(f'Date range: {df.index[0].date()} → {df.index[-1].date()}')
+          print(f'Latest close: £{df[\"close\"].iloc[-1]:.4f}')
+          "
+
+      # ── 7. Retrain models ────────────────────────────────────────
+      - name: Retrain XGBoost v2 + LSTM v2
+        run: |
+          echo "Running model_training_v2.py..."
+          python model_training_v2.py
+        env:
+          TF_CPP_MIN_LOG_LEVEL: "3"
+          # Suppress TensorFlow GPU warnings on CPU-only runner
+          CUDA_VISIBLE_DEVICES: "-1"
+
+      # ── 8. Verify new models were saved ─────────────────────────
+      - name: Verify model output
+        run: |
+          echo "=== New model files ==="
+          ls -lh models/
+          python -c "
+          import json, os
+          with open('models/model_metadata_v2.json') as f:
+              meta = json.load(f)
+          print(f'Best model  : {meta.get(\"best_model\", \"unknown\")}')
+          print(f'Trained at  : {meta.get(\"trained_at\", \"unknown\")}')
+          xgb = meta.get('xgboost_metrics', {})
+          lstm = meta.get('lstm_metrics', {})
+          print(f'XGB MAE     : £{xgb.get(\"mae\", 0):.4f}')
+          print(f'LSTM MAE    : £{lstm.get(\"mae\", 0):.4f}')
+          print(f'XGB DA      : {xgb.get(\"directional_accuracy\", 0):.2f}%')
+          print(f'LSTM DA     : {lstm.get(\"directional_accuracy\", 0):.2f}%')
+          "
+
+      # ── 9. Upload training report as artifact ───────────────────
+      # Keeps the last 90 days of reports for review
+      - name: Upload training report
+        uses: actions/upload-artifact@v4
+        with:
+          name: training-report-${{ github.run_number }}
+          path: |
+            reports/phase2_report_v2.txt
+            reports/plots/
+          retention-days: 90
+          if-no-files-found: warn
+
+      # ── 10. Commit and push new models ───────────────────────────
+      - name: Configure git
+        run: |
+          git config user.name  "OracleAU Bot"
+          git config user.email "oracleau-bot@users.noreply.github.com"
+
+      - name: Commit and push updated models
+        run: |
+          # Stage model files
+          git add models/
+
+          # Only commit if something actually changed
+          if git diff --staged --quiet; then
+            echo "No model changes detected — skipping commit"
+          else
+            # Get today's date and latest data date for the commit message
+            DATA_DATE=$(python -c "
+          import pandas as pd
+          df = pd.read_csv('data/SGLN_features.csv', index_col=0, parse_dates=True)
+          print(df.index[-1].date())
+            ")
+            TRAIN_DATE=$(date -u +"%Y-%m-%d")
+
+            git commit -m "retrain: models updated ${TRAIN_DATE} (data through ${DATA_DATE})"
+            git push origin main
+
+            echo "✓ Models committed and pushed"
+            echo "  Render will auto-redeploy the API"
+          fi
+
+      # ── 11. Summary ──────────────────────────────────────────────
+      - name: Print summary
+        if: always()
+        run: |
+          echo ""
+          echo "============================================"
+          echo "  OracleAU — Retrain Complete"
+          echo "============================================"
+          echo "  Triggered by : ${{ github.event_name }}"
+          echo "  Run number   : ${{ github.run_number }}"
+          echo "  Runner OS    : ${{ runner.os }}"
+          echo "  Completed at : $(date -u)"
+          echo "============================================"
