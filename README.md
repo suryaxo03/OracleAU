@@ -2,7 +2,7 @@
 
 **7-day price forecasting for SGLN.L** (iShares Physical Gold ETF, LSE) using an XGBoost v2 + LSTM v2 ensemble model.
 
-Live demo → `https://<your-username>.github.io/OracleAU`
+Live demo → `https://suryaxo03.github.io/OracleAU`
 
 ---
 
