@@ -157,84 +157,24 @@ def fetch_data(ticker: str, years: int) -> pd.DataFrame:
 # STEP 2 — CLEAN THE DATA
 # ================================================================
 
-def fix_currency_flip(df: pd.DataFrame,
-                      price_cols: list,
-                      window: int = 30,
-                      threshold: float = 0.40) -> pd.DataFrame:
-    """
-    Permanent rolling-median pence/pound auto-detector.
-
-    Yahoo Finance intermittently switches SGLN.L between reporting
-    in GBX (pence) and GBP (pounds) — sometimes mid-series, sometimes
-    reverting back after repair=True already fixed an earlier block.
-    This function catches ALL such flips on every pipeline run.
-
-    How it works:
-    - For each price column, compute a 30-day rolling median.
-    - If any row's price is less than `threshold` (40%) of its rolling
-      median, it's almost certainly in pounds while the surrounding
-      data is in pence — so multiply it by 100 to correct it.
-    - If any row's price is more than 1/threshold (250%) of its rolling
-      median, it's almost certainly in pence while surrounding data is
-      in pounds — so divide it by 100.
-    - The rolling median is robust to outliers (unlike rolling mean),
-      so genuine price spikes won't trigger false corrections.
-
-    Parameters:
-        df        : DataFrame with price columns
-        price_cols: Columns to check (open, high, low, close)
-        window    : Rolling window in trading days (default 30)
-        threshold : Flip detection sensitivity (default 0.40)
-    """
-    total_fixed = 0
-
-    for col in price_cols:
-        if col not in df.columns:
-            continue
-
-        rolling_med = df[col].rolling(
-            window=window, min_periods=5, center=True).median()
-
-        # Rows that look like pounds when series is in pence (too small)
-        too_small = df[col] < (rolling_med * threshold)
-
-        # Rows that look like pence when series is in pounds (too large)
-        too_large = df[col] > (rolling_med / threshold)
-
-        n_small = too_small.sum()
-        n_large = too_large.sum()
-
-        if n_small > 0:
-            df.loc[too_small, col] = (df.loc[too_small, col] * 100).round(4)
-            total_fixed += n_small
-            print(f"  ✓ [{col}] Fixed {n_small} row(s): pounds→pence (×100)")
-
-        if n_large > 0:
-            df.loc[too_large, col] = (df.loc[too_large, col] / 100).round(4)
-            total_fixed += n_large
-            print(f"  ✓ [{col}] Fixed {n_large} row(s): pence→pounds (÷100)")
-
-    if total_fixed == 0:
-        print(f"  ✓ Currency consistency check passed — no flips detected")
-
-    return df
-
-
 def clean_data(df: pd.DataFrame) -> pd.DataFrame:
     """
     Standardise column names, handle missing values, drop duplicates,
-    and apply the permanent pence/pound currency flip auto-detector.
+    and apply absolute-threshold pence/pound correction.
 
-    repair=True in yfinance fixes most currency issues but Yahoo
-    can revert to wrong units on new dates (as seen on 5 Mar 2026).
-    fix_currency_flip() catches these on every run going forward.
+    Stooq returns SGLN.UK in GBX (pence) for the entire series.
+    A rolling-median detector fails here because there is no
+    surrounding GBP data to compare against — the whole series
+    looks internally consistent in pence.
+
+    Instead we use an absolute threshold:
+      SGLN in GBP has traded between £15 and £200 since 2016.
+      Any median close above 500 is unambiguously pence → divide by 100.
     """
     print("\n[2/5] Cleaning data...")
 
     # ── Standardise column names to lowercase ────────────────────
     df.columns = [col.lower().replace(" ", "_") for col in df.columns]
-
-    # Drop the yfinance repair metadata column — not a feature
     df.drop(columns=["repaired?"], errors="ignore", inplace=True)
 
     # Ensure index is datetime
@@ -257,17 +197,21 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
     if missing_before:
         print(f"  ✓ Filled {missing_before} missing value(s) via forward/back-fill")
 
-    # ── Permanent currency flip fix ───────────────────────────────
-    # Runs on EVERY pipeline execution — catches any future Yahoo
-    # pence/pound switches regardless of when they occur.
-    print(f"  Running currency consistency check...")
-    price_cols = ["open", "high", "low", "close"]
-    df = fix_currency_flip(df, price_cols)
+    # ── Absolute currency correction ─────────────────────────────
+    # Threshold 500 sits safely between:
+    #   Max GBP price ever (~£200)  → well below 500
+    #   Min GBX price ever (~1500p) → well above 500
+    price_cols = [c for c in ["open", "high", "low", "close"] if c in df.columns]
+    median_close = df["close"].median()
 
-    # ── Prices are now consistently in GBP (pounds) ───────────────
-    # repair=True + fix_currency_flip() together ensure the full
-    # series is in £. No conversion columns needed.
-    print(f"  ✓ Prices confirmed in GBP (£) throughout full series")
+    if median_close > 500:
+        for col in price_cols:
+            df[col] = (df[col] / 100).round(4)
+        print(f"  ✓ Currency: was pence (median={median_close:.0f}p) "
+              f"→ divided by 100 → GBP (new median: £{df['close'].median():.2f})")
+    else:
+        print(f"  ✓ Currency: already GBP (median close: £{median_close:.2f})")
+
     print(f"  ✓ Clean data shape: {df.shape[0]:,} rows × {df.shape[1]} columns")
     print(f"  ✓ No remaining nulls: {df.isnull().sum().sum() == 0}")
 

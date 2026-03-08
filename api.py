@@ -35,6 +35,7 @@ import warnings
 from datetime import datetime, timedelta
 from typing import Optional
 
+import requests
 import numpy as np
 import pandas as pd
 import joblib
@@ -49,7 +50,6 @@ from pydantic import BaseModel
 from ta.trend import SMAIndicator, EMAIndicator, MACD
 from ta.momentum import RSIIndicator
 from ta.volatility import BollingerBands
-import requests
 
 # TensorFlow — suppress verbose logs
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -83,8 +83,8 @@ SEQUENCE_LEN = 45
 FORECAST_DAYS = 7
 
 # Ensemble weights (from model_metadata_v2.json)
-ENSEMBLE_WEIGHT_XGB  = 0.40
-ENSEMBLE_WEIGHT_LSTM = 0.60
+ENSEMBLE_WEIGHT_XGB  = 0.30
+ENSEMBLE_WEIGHT_LSTM = 0.70
 CONFIDENCE_THRESHOLD = 0.50   # % difference → HIGH confidence boundary
 
 # Cache settings — avoids hammering Yahoo Finance
@@ -339,7 +339,16 @@ def fetch_sgln_data(years: int = 2) -> pd.DataFrame:
 
 
 def _clean_raw(raw: pd.DataFrame) -> pd.DataFrame:
-    """Standardise, deduplicate, fill gaps, fix currency flips."""
+    """Standardise, deduplicate, fill gaps, fix currency units.
+
+    Stooq returns SGLN.UK in GBX (pence) — the entire series is in
+    pence so a rolling-median detector sees nothing anomalous.
+    Instead we use an absolute threshold:
+      - SGLN in GBP has traded between £15 and £200 since 2016
+      - Any median close above £500 means the series is in pence
+      - Divide all OHLC columns by 100 to convert to pounds
+    This is unconditional and reliable regardless of data source.
+    """
 
     # Flatten MultiIndex columns if present
     if isinstance(raw.columns, pd.MultiIndex):
@@ -354,22 +363,24 @@ def _clean_raw(raw: pd.DataFrame) -> pd.DataFrame:
     df = df[~df.index.duplicated(keep="first")].sort_index()
     df = df.ffill().bfill()
 
-    # Rolling-median currency flip detector
-    # (catches any Yahoo pence/pound switches repair=True missed)
-    for col in ["open", "high", "low", "close"]:
-        if col not in df.columns:
-            continue
-        med = df[col].rolling(window=30, min_periods=5, center=True).median()
-        too_small = df[col] < (med * 0.40)
-        too_large = df[col] > (med / 0.40)
-        if too_small.sum() > 0:
-            df.loc[too_small, col] = (df.loc[too_small, col] * 100).round(4)
-            log.info(f"Currency fix: {too_small.sum()} rows in '{col}' "
-                     f"multiplied ×100 (pounds→pence)")
-        if too_large.sum() > 0:
-            df.loc[too_large, col] = (df.loc[too_large, col] / 100).round(4)
-            log.info(f"Currency fix: {too_large.sum()} rows in '{col}' "
-                     f"divided ÷100 (pence→pounds)")
+    # ── Absolute currency correction ─────────────────────────────
+    # If the median close is above 500, the full series is in pence.
+    # Divide all OHLC columns by 100 unconditionally in that case.
+    # Threshold 500 is safely between:
+    #   - Max GBP price ever (~£200)  → well below 500
+    #   - Min GBX price ever (~1500p) → well above 500
+    price_cols = [c for c in ["open", "high", "low", "close"] if c in df.columns]
+    median_close = df["close"].median()
+
+    if median_close > 500:
+        for col in price_cols:
+            df[col] = (df[col] / 100).round(4)
+        log.info(f"Currency: series was in pence (median={median_close:.0f}p) "
+                 f"— divided all OHLC by 100 → GBP "
+                 f"(new median: £{df['close'].median():.2f})")
+    else:
+        log.info(f"Currency: series already in GBP "
+                 f"(median close: £{median_close:.2f})")
 
     return df
 
