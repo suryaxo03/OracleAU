@@ -8,10 +8,11 @@
 #   1. Fetches fresh SGLN.L data from Stooq
 #   2. Retrains XGBoost v2 + LSTM v2 on the latest data
 #   3. Commits the new model files back to the repo
-#   4. Render detects the push and auto-redeploys the API
+#   4. Calls Render Deploy Hook directly to trigger redeploy
 #
 # Secrets required (repo Settings → Secrets → Actions):
-#   GH_PAT — Personal Access Token with Contents: Read & Write
+#   GH_PAT              — Personal Access Token with Contents: Read & Write
+#   RENDER_DEPLOY_HOOK  — Deploy Hook URL from Render dashboard
 # ================================================================
 
 name: Weekly Retrain
@@ -94,7 +95,6 @@ jobs:
           python model_training_v2.py
         env:
           TF_CPP_MIN_LOG_LEVEL: "3"
-          # Suppress TensorFlow GPU warnings on CPU-only runner
           CUDA_VISIBLE_DEVICES: "-1"
 
       # ── 8. Verify new models were saved ─────────────────────────
@@ -117,7 +117,6 @@ jobs:
           "
 
       # ── 9. Upload training report as artifact ───────────────────
-      # Keeps the last 90 days of reports for review
       - name: Upload training report
         uses: actions/upload-artifact@v4
         with:
@@ -135,15 +134,14 @@ jobs:
           git config user.email "oracleau-bot@users.noreply.github.com"
 
       - name: Commit and push updated models
+        id: commit
         run: |
-          # Stage model files
           git add models/
 
-          # Only commit if something actually changed
           if git diff --staged --quiet; then
             echo "No model changes detected — skipping commit"
+            echo "models_changed=false" >> $GITHUB_OUTPUT
           else
-            # Get today's date and latest data date for the commit message
             DATA_DATE=$(python -c "
           import pandas as pd
           df = pd.read_csv('data/SGLN_features.csv', index_col=0, parse_dates=True)
@@ -155,10 +153,30 @@ jobs:
             git push origin main
 
             echo "✓ Models committed and pushed"
-            echo "  Render will auto-redeploy the API"
+            echo "models_changed=true" >> $GITHUB_OUTPUT
           fi
 
-      # ── 11. Summary ──────────────────────────────────────────────
+      # ── 11. Trigger Render deploy via Deploy Hook ─────────────────
+      # Calls the hook directly — this is more reliable than waiting
+      # for Render to detect a bot push via git webhook.
+      # Runs whether or not models changed (always redeploy after retrain).
+      - name: Trigger Render redeploy
+        run: |
+          echo "Calling Render Deploy Hook..."
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
+            --max-time 30 \
+            "${{ secrets.RENDER_DEPLOY_HOOK }}")
+
+          if [ "$RESPONSE" = "200" ] || [ "$RESPONSE" = "201" ]; then
+            echo "✓ Render deploy triggered successfully (HTTP $RESPONSE)"
+            echo "  API will be live with fresh models in ~3 minutes"
+          else
+            echo "✗ Render deploy hook returned HTTP $RESPONSE"
+            echo "  Check Render dashboard manually"
+            exit 1
+          fi
+
+      # ── 12. Summary ──────────────────────────────────────────────
       - name: Print summary
         if: always()
         run: |
