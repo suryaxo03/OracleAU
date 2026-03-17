@@ -1,8 +1,7 @@
 /* ================================================================
    CONFIG — point this at your API
 ================================================================ */
-// const API_BASE = 'http://localhost:8000';
-const API_BASE = 'https://oracleau.onrender.com';
+const API_BASE = 'http://localhost:8000';
 
 /* ================================================================
    STATE
@@ -12,18 +11,6 @@ let currentPeriod  = '3m';
 let historyCache   = {};
 let forecastData   = null;
 let lastKnownPrice = null;
-
-/* ================================================================
-   KNOWN LIVE RESULTS (seeded from our 5-day evaluation)
-   Format: { date, predicted, actual, prevClose }
-================================================================ */
-const KNOWN_RESULTS = [
-  { date: '2026-02-27', predicted: 74.5169, actual: 75.41,  prevClose: 74.45 },
-  { date: '2026-03-02', predicted: 74.5790, actual: 76.90,  prevClose: 75.41 },
-  { date: '2026-03-03', predicted: 74.6302, actual: 74.64,  prevClose: 76.90 },
-  { date: '2026-03-04', predicted: 74.6814, actual: 74.81,  prevClose: 74.64 },
-  { date: '2026-03-05', predicted: 74.7391, actual: 73.82,  prevClose: 74.81 },
-];
 
 /* ================================================================
    UTILITIES
@@ -378,58 +365,150 @@ async function loadIndicators() {
 }
 
 /* ================================================================
-   ACCURACY TRACKER — seeded with known results
+   ACCURACY TRACKER — fetched live from /api/accuracy
 ================================================================ */
-function renderAccuracy() {
-  const tbody   = $('accuracy-tbody');
-  const track   = $('acc-track');
-  tbody.innerHTML = '';
+async function loadAccuracy() {
+  const tbody = $('accuracy-tbody');
+  const track = $('acc-track');
+
+  tbody.innerHTML = `<tr><td colspan="6" style="text-align:center;color:var(--text-muted);padding:20px">Loading accuracy data...</td></tr>`;
   track.innerHTML = '';
 
-  let correct = 0;
-  let totalErr = 0;
+  try {
+    const d = await apiFetch('/api/accuracy');
 
-  KNOWN_RESULTS.forEach(row => {
-    const err     = (row.actual - row.predicted);
-    const absErr  = Math.abs(err);
-    const actDir  = row.actual > row.prevClose ? 'UP' : 'DOWN';
-    const predDir = row.predicted > row.prevClose ? 'UP' : 'DOWN';
-    const isCorrect = actDir === predDir;
+    // ── Summary tiles ─────────────────────────────────────────
+    if (d.directional_acc !== null) {
+      $('acc-live-da').textContent = d.directional_acc + '%';
+      $('acc-live-da').parentElement.querySelector('.acc-tile-sub').textContent =
+        `${d.total_evaluated} evaluated`;
+    }
+    if (d.mae !== null) {
+      $('acc-mae').textContent = '£' + fmt(d.mae, 4);
+    }
 
-    if (isCorrect) correct++;
-    totalErr += absErr;
+    // ── No data yet ───────────────────────────────────────────
+    if (!d.results || d.results.length === 0) {
+      tbody.innerHTML = `
+        <tr><td colspan="6" style="text-align:center;color:var(--text-muted);padding:24px">
+          No forecast history yet — accuracy data builds automatically over time.
+        </td></tr>`;
+      return;
+    }
 
-    const resultCls  = isCorrect ? 'correct' : 'miss';
-    const resultText = isCorrect ? '✓ Correct' : '✗ Miss';
-    const errCls     = err >= 0 ? 'up' : 'down';
+    // ── Table rows ────────────────────────────────────────────
+    tbody.innerHTML = '';
+    track.innerHTML = '';
 
-    tbody.innerHTML += `
-      <tr>
-        <td style="color:var(--text-secondary)">${fmtDate(row.date)}</td>
-        <td style="text-align:right" class="acc-col-predicted">£${fmt(row.predicted, 4)}</td>
-        <td style="text-align:right;color:var(--text-primary)">£${fmt(row.actual, 4)}</td>
-        <td style="text-align:right" class="td-change acc-col-error ${errCls}">${err >= 0 ? '+' : ''}${fmt(err, 4)}</td>
-        <td style="text-align:right">
-          <span style="color:${actDir === 'UP' ? 'var(--up)' : 'var(--down)'}">
-            ${actDir === 'UP' ? '▲' : '▼'} ${actDir}
-          </span>
-        </td>
-        <td style="text-align:right">
-          <span class="result-pill ${resultCls}">${resultText}</span>
-        </td>
-      </tr>
-    `;
+    // Show most recent 10 evaluated days at top, then pending
+    const evaluated = d.results.filter(r => r.status === 'evaluated').slice(0, 10);
+    const pending   = d.results.filter(r => r.status === 'pending').slice(0, 3);
+    const rows      = [...evaluated, ...pending];
 
-    track.innerHTML += `<div class="acc-bar ${resultCls}" title="${row.date}">${isCorrect ? '✓' : '✗'}</div>`;
-  });
+    rows.forEach(row => {
+      if (row.status === 'pending') {
+        tbody.innerHTML += `
+          <tr style="opacity:0.5">
+            <td style="color:var(--text-secondary)">${fmtDate(row.date)}</td>
+            <td style="text-align:right" class="acc-col-predicted">£${fmt(row.predicted, 4)}</td>
+            <td style="text-align:right;color:var(--text-muted)">Pending</td>
+            <td style="text-align:right" class="acc-col-error td-change">—</td>
+            <td style="text-align:right">
+              <span style="color:var(--text-muted)">${row.pred_direction}</span>
+            </td>
+            <td style="text-align:right">
+              <span class="result-pill pending">Pending</span>
+            </td>
+          </tr>`;
+        track.innerHTML += `<div class="acc-bar pending" title="${row.date}">?</div>`;
+        return;
+      }
 
-  // Update summary tiles with computed values
-  const da  = ((correct / KNOWN_RESULTS.length) * 100).toFixed(0);
-  const mae = (totalErr / KNOWN_RESULTS.length).toFixed(2);
-  $('acc-live-da').textContent = da + '%';
-  $('acc-live-da').parentElement.querySelector('.acc-tile-sub').textContent =
-    `${correct}/${KNOWN_RESULTS.length} correct`;
-  $('acc-mae').textContent = '£' + mae;
+      const err       = row.error || 0;
+      const errCls    = err >= 0 ? 'up' : 'down';
+      const isCorrect = row.correct;
+      const resultCls = isCorrect ? 'correct' : 'miss';
+      const actDir    = row.act_direction || '—';
+
+      tbody.innerHTML += `
+        <tr>
+          <td style="color:var(--text-secondary)">${fmtDate(row.date)}</td>
+          <td style="text-align:right" class="acc-col-predicted">£${fmt(row.predicted, 4)}</td>
+          <td style="text-align:right;color:var(--text-primary)">£${fmt(row.actual, 4)}</td>
+          <td style="text-align:right" class="td-change acc-col-error ${errCls}">${err >= 0 ? '+' : ''}${fmt(err, 4)}</td>
+          <td style="text-align:right">
+            <span style="color:${actDir === 'UP' ? 'var(--up)' : 'var(--down)'}">
+              ${actDir === 'UP' ? '▲' : '▼'} ${actDir}
+            </span>
+          </td>
+          <td style="text-align:right">
+            <span class="result-pill ${resultCls}">${isCorrect ? '✓ Correct' : '✗ Miss'}</span>
+          </td>
+        </tr>`;
+      track.innerHTML += `<div class="acc-bar ${resultCls}" title="${row.date}">${isCorrect ? '✓' : '✗'}</div>`;
+    });
+
+  } catch(e) {
+    tbody.innerHTML = `<tr><td colspan="6"><div class="error-state">Accuracy data unavailable — ${e.message}</div></td></tr>`;
+    console.error('Accuracy load failed:', e);
+  }
+}
+
+/* ================================================================
+   STATS — visit counter from MongoDB via /api/stats
+================================================================ */
+async function loadStats() {
+  try {
+    const d = await apiFetch('/api/stats');
+    const el = $('footer-visits');
+    if (!el) return;
+
+    if (!d.db_connected || d.total_visits === null) {
+      el.innerHTML = '';
+      return;
+    }
+
+    el.innerHTML =
+      `<span style="color:var(--gold-dim)">◆</span> ` +
+      `<span style="color:var(--text-muted)">` +
+      `${d.total_visits.toLocaleString()} visits` +
+      (d.visits_today > 0 ? ` · ${d.visits_today} today` : '') +
+      `</span>`;
+
+  } catch(e) {
+    // Non-critical — silently ignore if stats unavailable
+  }
+}
+
+/* ================================================================
+   STATS — visit counter from MongoDB via /api/stats
+================================================================ */
+async function loadStats() {
+  try {
+    const d = await apiFetch('/api/stats');
+    if (!d.db_connected) return;
+
+    // Total visits
+    if (d.total_visits !== null) {
+      const el = $('footer-visits');
+      if (el) {
+        el.textContent = d.total_visits.toLocaleString() + ' dashboard loads';
+        el.style.display = 'inline';
+      }
+    }
+
+    // Visits today
+    if (d.visits_today !== null) {
+      const el = $('footer-visits-today');
+      if (el) {
+        el.textContent = d.visits_today + ' today';
+        el.style.display = 'inline';
+      }
+    }
+  } catch(e) {
+    // Stats are non-critical — fail silently
+    console.debug('Stats load failed (non-critical):', e);
+  }
 }
 
 /* ================================================================
@@ -446,7 +525,9 @@ async function init() {
   await checkHealth();
   await Promise.all([loadPrice(), loadForecast(), loadIndicators()]);
   await loadHistory('3m');
-  renderAccuracy();
+  await loadAccuracy();
+  loadStats();   // Non-blocking — fire and forget
+  loadStats();   // Non-blocking — fire and forget
 }
 
 // Refresh price and health silently every 5 minutes

@@ -13,6 +13,8 @@ Endpoints:
     GET /api/forecast        — 7-day ensemble forecast + confidence
     GET /api/history         — Historical OHLCV for charting
     GET /api/indicators      — Latest technical indicator values
+    GET /api/accuracy        — Past forecast vs actual accuracy
+    GET /api/stats           — Visit counts and usage stats
 
 Usage (local):
     uvicorn api:app --reload --port 8000
@@ -35,7 +37,6 @@ import warnings
 from datetime import datetime, timedelta
 from typing import Optional
 
-import requests
 import numpy as np
 import pandas as pd
 import joblib
@@ -59,6 +60,15 @@ from tensorflow.keras.models import load_model
 
 warnings.filterwarnings("ignore")
 
+# MongoDB
+try:
+    from pymongo import MongoClient, ASCENDING, DESCENDING
+    from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
+    MONGO_AVAILABLE = True
+except ImportError:
+    MONGO_AVAILABLE = False
+    # Note: log not yet defined here — warning emitted at startup instead
+
 # ================================================================
 # LOGGING
 # ================================================================
@@ -78,13 +88,18 @@ log = logging.getLogger("oracleau")
 TICKER_STOOQ = "SGLN.UK"   # Stooq ticker (LSE stocks use .UK suffix)
 TICKER       = "SGLN.L"    # Display name (how it appears to users)
 STOOQ_URL    = "https://stooq.com/q/d/l/?s={ticker}&i=d"
-MODELS_DIR   = "models"
+MODELS_DIR        = "models"
+FORECAST_LOG_PATH = os.path.join(MODELS_DIR, "forecast_log.json")
+
+# MongoDB — URI loaded from environment variable (never hardcoded)
+MONGO_URI         = os.environ.get("MONGO_URI", "")
+MONGO_DB_NAME     = "oracleau"
 SEQUENCE_LEN = 45
 FORECAST_DAYS = 7
 
 # Ensemble weights (from model_metadata_v2.json)
-ENSEMBLE_WEIGHT_XGB  = 0.30
-ENSEMBLE_WEIGHT_LSTM = 0.70
+ENSEMBLE_WEIGHT_XGB  = 0.40
+ENSEMBLE_WEIGHT_LSTM = 0.60
 CONFIDENCE_THRESHOLD = 0.50   # % difference → HIGH confidence boundary
 
 # Cache settings — avoids hammering Yahoo Finance
@@ -199,6 +214,14 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def startup_event():
+    if not MONGO_AVAILABLE:
+        log.warning("pymongo not installed — database features disabled")
+    elif not MONGO_URI:
+        log.warning("MONGO_URI not set — database features disabled")
+    else:
+        # Eagerly connect so first request isn't slow
+        get_db()
+
     """Load all models and scalers when the server starts."""
     log.info("=" * 55)
     log.info("  OracleAU API — Starting up")
@@ -625,6 +648,154 @@ def run_forecast(df: pd.DataFrame) -> dict:
     }
 
 
+
+# ================================================================
+# DATABASE — MongoDB Atlas connection + helpers
+# ================================================================
+
+_mongo_client = None
+_mongo_db     = None
+
+
+def get_db():
+    """
+    Return MongoDB database handle.
+    Lazily initialises the connection on first call.
+    Returns None gracefully if MONGO_URI is not set or connection fails.
+    """
+    global _mongo_client, _mongo_db
+
+    if _mongo_db is not None:
+        return _mongo_db
+
+    if not MONGO_AVAILABLE or not MONGO_URI:
+        log.warning("MongoDB not configured — MONGO_URI env var missing")
+        return None
+
+    try:
+        _mongo_client = MongoClient(
+            MONGO_URI,
+            serverSelectionTimeoutMS = 5000,   # 5s timeout
+            connectTimeoutMS         = 5000,
+        )
+        # Ping to confirm connection is alive
+        _mongo_client.admin.command("ping")
+        _mongo_db = _mongo_client[MONGO_DB_NAME]
+
+        # ── Ensure indexes exist ──────────────────────────────
+        _mongo_db.forecasts.create_index([("base_date", ASCENDING)], unique=True)
+        _mongo_db.accuracy.create_index( [("date",      ASCENDING)], unique=True)
+        _mongo_db.visits.create_index(   [("timestamp", DESCENDING)])
+
+        log.info(f"MongoDB connected — db: {MONGO_DB_NAME}")
+        return _mongo_db
+
+    except (ConnectionFailure, ServerSelectionTimeoutError) as e:
+        log.error(f"MongoDB connection failed: {e}")
+        return None
+    except Exception as e:
+        log.error(f"MongoDB unexpected error: {e}")
+        return None
+
+
+def _log_forecast(forecast_result: dict) -> None:
+    """
+    Persist today's forecast to MongoDB forecasts collection.
+    Falls back to local JSON file if MongoDB is unavailable.
+    Only writes once per base_date — idempotent.
+    """
+    base_date = forecast_result.get("last_date")
+    entry = {
+        "base_date"   : base_date,
+        "last_close"  : forecast_result.get("last_close"),
+        "logged_at"   : datetime.now().isoformat(),
+        "predictions" : [
+            {
+                "date"       : d["date"],
+                "day"        : d["day"],
+                "ensemble"   : d["ensemble"],
+                "xgboost"    : d["xgboost"],
+                "lstm"       : d["lstm"],
+                "direction"  : d["direction"],
+                "confidence" : d["confidence"],
+            }
+            for d in forecast_result.get("forecast", [])
+        ]
+    }
+
+    # ── Try MongoDB first ─────────────────────────────────────
+    db = get_db()
+    if db is not None:
+        try:
+            db.forecasts.update_one(
+                {"base_date": base_date},
+                {"$setOnInsert": entry},
+                upsert=True,   # Insert only if base_date not already present
+            )
+            log.info(f"Forecast logged to MongoDB for {base_date}")
+            return
+        except Exception as e:
+            log.warning(f"MongoDB forecast write failed, falling back to file: {e}")
+
+    # ── Fallback: local JSON file ─────────────────────────────
+    try:
+        entries = []
+        if os.path.exists(FORECAST_LOG_PATH):
+            with open(FORECAST_LOG_PATH) as f:
+                entries = json.load(f)
+        existing = {e["base_date"] for e in entries}
+        if base_date not in existing:
+            entries = (entries + [entry])[-60:]
+            os.makedirs(MODELS_DIR, exist_ok=True)
+            with open(FORECAST_LOG_PATH, "w") as f:
+                json.dump(entries, f, indent=2)
+            log.info(f"Forecast logged to file (fallback) for {base_date}")
+    except Exception as e:
+        log.warning(f"Forecast file fallback also failed: {e}")
+
+
+def _load_forecasts() -> list:
+    """
+    Load all forecast entries — from MongoDB if available, else local file.
+    Returns list of forecast dicts sorted oldest-first.
+    """
+    db = get_db()
+    if db is not None:
+        try:
+            return list(db.forecasts.find(
+                {}, {"_id": 0}
+            ).sort("base_date", ASCENDING))
+        except Exception as e:
+            log.warning(f"MongoDB forecast read failed: {e}")
+
+    # Fallback to local file
+    try:
+        if os.path.exists(FORECAST_LOG_PATH):
+            with open(FORECAST_LOG_PATH) as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return []
+
+
+def _log_visit(endpoint: str) -> None:
+    """
+    Record a dashboard visit to MongoDB visits collection.
+    Fire-and-forget — never raises, never blocks the response.
+    """
+    db = get_db()
+    if db is None:
+        return
+    try:
+        db.visits.insert_one({
+            "timestamp" : datetime.now().isoformat(),
+            "endpoint"  : endpoint,
+            "date"      : str(datetime.now().date()),
+        })
+    except Exception as e:
+        log.debug(f"Visit log failed (non-critical): {e}")
+
+
 # ================================================================
 # HELPER — RSI / MACD signal interpretation
 # ================================================================
@@ -689,6 +860,8 @@ async def get_price():
     Latest SGLN.L price with OHLCV, daily change, and 52-week range.
     Data is cached for 5 minutes to avoid Yahoo Finance rate limits.
     """
+    _log_visit("/api/price")   # Count as a dashboard load
+    _log_visit("/api/price")   # Track dashboard load
     df = fetch_sgln_data(years=2)
 
     # Latest row
@@ -740,8 +913,11 @@ async def get_forecast():
             detail      = "Models not loaded. Run model_training_v2.py first.",
         )
 
-    df = fetch_sgln_data(years=2)
-    return run_forecast(df)
+    df     = fetch_sgln_data(years=2)
+    result = run_forecast(df)
+    _log_forecast(result)      # Persist prediction to MongoDB
+    _log_visit("/api/forecast") # Track visit
+    return result
 
 
 # ── /api/history ──────────────────────────────────────────────────
@@ -874,6 +1050,157 @@ async def get_indicators():
             "death_cross"  : bool(latest.get("death_cross",  0)),
         },
     }
+
+
+
+# ── /api/accuracy ─────────────────────────────────────────────────
+
+@app.get("/api/accuracy", tags=["Forecast"])
+async def get_accuracy():
+    """
+    Compares past forecasts against actual prices.
+    Reads the forecast log written by /api/forecast, fetches actual
+    prices from Stooq, and returns per-day accuracy results.
+    Returns up to 30 evaluated forecast days.
+    """
+    entries = _load_forecasts()
+    if not entries:
+        return {
+            "results"           : [],
+            "directional_acc"   : None,
+            "mae"               : None,
+            "total_evaluated"   : 0,
+            "message"           : "No forecast history yet. "
+                                  "Accuracy data builds up over time.",
+        }
+
+    # Fetch enough history to cover all logged forecast dates
+    df = fetch_sgln_data(years=2)
+    actual_prices = {str(d.date()): row["close"]
+                     for d, row in df.iterrows()}
+
+    results    = []
+    correct    = 0
+    total_err  = 0.0
+    evaluated  = 0
+
+    for entry in reversed(entries):   # Most recent first
+        base_close = entry.get("last_close")
+
+        for pred in entry.get("predictions", []):
+            target_date = pred["date"]
+            predicted   = pred["ensemble"]
+            actual      = actual_prices.get(target_date)
+
+            if actual is None:
+                # Future date — not yet available
+                results.append({
+                    "date"          : target_date,
+                    "predicted"     : predicted,
+                    "actual"        : None,
+                    "error"         : None,
+                    "pred_direction": pred["direction"],
+                    "act_direction" : None,
+                    "correct"       : None,
+                    "confidence"    : pred["confidence"],
+                    "status"        : "pending",
+                })
+                continue
+
+            # Compute result
+            error        = round(actual - predicted, 4)
+            abs_err      = abs(error)
+            pred_dir     = pred["direction"]
+            act_dir      = "UP" if actual > base_close else "DOWN"
+            is_correct   = pred_dir == act_dir
+
+            if is_correct:
+                correct += 1
+            total_err += abs_err
+            evaluated += 1
+
+            results.append({
+                "date"          : target_date,
+                "predicted"     : predicted,
+                "actual"        : round(actual, 4),
+                "error"         : error,
+                "pred_direction": pred_dir,
+                "act_direction" : act_dir,
+                "correct"       : is_correct,
+                "confidence"    : pred["confidence"],
+                "status"        : "evaluated",
+            })
+
+            base_close = actual   # Roll forward for next day's direction
+
+        if len(results) >= 30:
+            break
+
+    da  = round((correct / evaluated * 100), 1) if evaluated > 0 else None
+    mae = round(total_err / evaluated, 4)        if evaluated > 0 else None
+
+    return {
+        "results"           : results,
+        "directional_acc"   : da,
+        "mae"               : mae,
+        "total_evaluated"   : evaluated,
+        "total_pending"     : sum(1 for r in results if r["status"] == "pending"),
+    }
+
+
+
+# ── /api/stats ────────────────────────────────────────────────────
+
+@app.get("/api/stats", tags=["System"])
+async def get_stats():
+    """
+    Usage statistics from MongoDB.
+    Returns total dashboard visits, visits today, and forecast count.
+    """
+    db = get_db()
+    if db is None:
+        return {
+            "total_visits"    : None,
+            "visits_today"    : None,
+            "total_forecasts" : None,
+            "db_connected"    : False,
+            "message"         : "Database not connected",
+        }
+
+    try:
+        today = str(datetime.now().date())
+
+        total_visits    = db.visits.count_documents({})
+        visits_today    = db.visits.count_documents({"date": today})
+        total_forecasts = db.forecasts.count_documents({})
+
+        # Visits over last 7 days
+        from datetime import timedelta
+        last_7 = [
+            str((datetime.now() - timedelta(days=i)).date())
+            for i in range(6, -1, -1)
+        ]
+        daily_visits = []
+        for d in last_7:
+            count = db.visits.count_documents({"date": d})
+            daily_visits.append({"date": d, "count": count})
+
+        return {
+            "total_visits"    : total_visits,
+            "visits_today"    : visits_today,
+            "total_forecasts" : total_forecasts,
+            "daily_visits"    : daily_visits,
+            "db_connected"    : True,
+        }
+
+    except Exception as e:
+        log.error(f"Stats query failed: {e}")
+        return {
+            "total_visits" : None,
+            "visits_today" : None,
+            "db_connected" : False,
+            "message"      : str(e),
+        }
 
 
 # ================================================================

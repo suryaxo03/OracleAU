@@ -13,6 +13,7 @@
 # Secrets required (repo Settings → Secrets → Actions):
 #   GH_PAT              — Personal Access Token with Contents: Read & Write
 #   RENDER_DEPLOY_HOOK  — Deploy Hook URL from Render dashboard
+#   MONGO_URI           — MongoDB Atlas connection string
 # ================================================================
 
 name: Weekly Retrain
@@ -96,6 +97,7 @@ jobs:
         env:
           TF_CPP_MIN_LOG_LEVEL: "3"
           CUDA_VISIBLE_DEVICES: "-1"
+          MONGO_URI: ${{ secrets.MONGO_URI }}
 
       # ── 8. Verify new models were saved ─────────────────────────
       - name: Verify model output
