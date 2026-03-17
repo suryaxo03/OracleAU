@@ -36,6 +36,7 @@ import logging
 import warnings
 from datetime import datetime, timedelta
 from typing import Optional
+import requests
 
 import numpy as np
 import pandas as pd
@@ -43,8 +44,8 @@ import joblib
 from io import StringIO
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 # Technical indicators
@@ -82,6 +83,19 @@ log = logging.getLogger("oracleau")
 
 
 # ================================================================
+# ENVIRONMENT — load .env file when running locally
+# ================================================================
+# python-dotenv reads a .env file in the project root when present.
+# On Render, real environment variables are used instead.
+# The .env file is gitignored — never committed to the repo.
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()   # Loads .env if present, silently skips if not found
+except ImportError:
+    pass            # python-dotenv not installed — fine on Render
+
+# ================================================================
 # CONFIGURATION
 # ================================================================
 
@@ -91,7 +105,9 @@ STOOQ_URL    = "https://stooq.com/q/d/l/?s={ticker}&i=d"
 MODELS_DIR        = "models"
 FORECAST_LOG_PATH = os.path.join(MODELS_DIR, "forecast_log.json")
 
-# MongoDB — URI loaded from environment variable (never hardcoded)
+# ── MongoDB ───────────────────────────────────────────────────────
+# LOCAL:  Set MONGO_URI in your .env file (see .env.example)
+# RENDER: Set MONGO_URI in Render dashboard → Environment Variables
 MONGO_URI         = os.environ.get("MONGO_URI", "")
 MONGO_DB_NAME     = "oracleau"
 SEQUENCE_LEN = 45
@@ -214,18 +230,22 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def startup_event():
-    if not MONGO_AVAILABLE:
-        log.warning("pymongo not installed — database features disabled")
-    elif not MONGO_URI:
-        log.warning("MONGO_URI not set — database features disabled")
-    else:
-        # Eagerly connect so first request isn't slow
-        get_db()
-
-    """Load all models and scalers when the server starts."""
+    """Load models and connect to MongoDB when the server starts."""
     log.info("=" * 55)
     log.info("  OracleAU API — Starting up")
     log.info("=" * 55)
+
+    # MongoDB connection
+    if not MONGO_AVAILABLE:
+        log.warning("pymongo not installed — database features disabled")
+    elif not MONGO_URI:
+        log.warning("MONGO_URI not set — set it in .env (local) or Render dashboard (deploy)")
+    else:
+        get_db()   # Eagerly connect so first request isn't slow
+
+    # Model loading — logs working directory to help debug path issues
+    log.info(f"Working directory: {os.getcwd()}")
+    log.info(f"Models directory:  {os.path.abspath(MODELS_DIR)}")
     load_models()
     log.info("Startup complete. Ready to serve requests.")
 
@@ -313,6 +333,7 @@ def fetch_sgln_data(years: int = 2) -> pd.DataFrame:
     url = STOOQ_URL.format(ticker=TICKER_STOOQ.lower())
     log.info(f"Fetching fresh data from Stooq: {url}")
 
+    # ── Step 1: Fetch from Stooq ─────────────────────────────────
     try:
         response = requests.get(url, timeout=30)
         response.raise_for_status()
@@ -322,18 +343,15 @@ def fetch_sgln_data(years: int = 2) -> pd.DataFrame:
             index_col   = "Date",
         )
     except Exception as e:
-        # Stooq failed — serve stale cache rather than crashing the API
         stale = state.get_cache()
         if stale is not None:
             log.warning(f"Stooq fetch failed ({e}) — serving stale cache")
             state.mark_stale()
             return stale
+        log.error(f"Stooq fetch failed with no cache to fall back on: {e}")
         raise HTTPException(
             status_code = 503,
-            detail = (
-                f"Unable to fetch data from Stooq ({e}). "
-                "Check your internet connection and try again."
-            )
+            detail = f"Unable to fetch data from Stooq: {e}"
         )
 
     if raw is None or raw.empty:
@@ -347,15 +365,32 @@ def fetch_sgln_data(years: int = 2) -> pd.DataFrame:
             detail = f"No data returned for {TICKER_STOOQ} from Stooq.",
         )
 
-    # Stooq returns newest-first — sort to chronological
+    # ── Step 2: Sort and validate ─────────────────────────────────
     raw = raw.sort_index()
     log.info(f"✓ Fetched {len(raw)} rows  "
              f"({raw.index[0].date()} → {raw.index[-1].date()})")
 
-    # ── Clean and process ────────────────────────────────────────
-    df = _clean_raw(raw)
-    df = _add_indicators(df)
-    df = _add_targets(df)
+    # ── Step 3: Clean, indicators, targets ───────────────────────
+    try:
+        log.info("Processing: _clean_raw...")
+        df = _clean_raw(raw)
+        log.info("Processing: _add_indicators...")
+        df = _add_indicators(df)
+        log.info("Processing: _add_targets...")
+        df = _add_targets(df)
+    except Exception as e:
+        import traceback
+        log.error(f"Data processing failed: {e}")
+        log.error(traceback.format_exc())
+        stale = state.get_cache()
+        if stale is not None:
+            log.warning("Processing failed — serving stale cache")
+            state.mark_stale()
+            return stale
+        raise HTTPException(
+            status_code = 503,
+            detail = f"Data processing error: {e}"
+        )
 
     state.set_cache(df)
     return df
@@ -683,7 +718,8 @@ def get_db():
         _mongo_db = _mongo_client[MONGO_DB_NAME]
 
         # ── Ensure indexes exist ──────────────────────────────
-        _mongo_db.forecasts.create_index([("base_date", ASCENDING)], unique=True)
+        _mongo_db.forecasts.create_index([("week_key",  ASCENDING)], unique=True)
+        _mongo_db.forecasts.create_index([("base_date", ASCENDING)])
         _mongo_db.accuracy.create_index( [("date",      ASCENDING)], unique=True)
         _mongo_db.visits.create_index(   [("timestamp", DESCENDING)])
 
@@ -698,15 +734,34 @@ def get_db():
         return None
 
 
+def _get_week_key(date_str: str) -> str:
+    """
+    Return the ISO week key for a date string (e.g. '2026-W12').
+    Used to group forecasts by the week they were made.
+    """
+    d = datetime.strptime(date_str, "%Y-%m-%d")
+    return f"{d.isocalendar()[0]}-W{d.isocalendar()[1]:02d}"
+
+
 def _log_forecast(forecast_result: dict) -> None:
     """
-    Persist today's forecast to MongoDB forecasts collection.
+    Persist this week's forecast to MongoDB — one entry per ISO week.
+
+    Weekly cycle:
+      - Sunday: models retrain, Render redeploys
+      - Monday: first /api/forecast call logs the week's predictions
+      - Following Monday: /api/accuracy evaluates last week's predictions
+                          against actuals now available from Stooq
+
+    Only writes once per week_key — idempotent, safe to call daily.
     Falls back to local JSON file if MongoDB is unavailable.
-    Only writes once per base_date — idempotent.
     """
     base_date = forecast_result.get("last_date")
+    week_key  = _get_week_key(base_date)
+
     entry = {
         "base_date"   : base_date,
+        "week_key"    : week_key,
         "last_close"  : forecast_result.get("last_close"),
         "logged_at"   : datetime.now().isoformat(),
         "predictions" : [
@@ -728,11 +783,11 @@ def _log_forecast(forecast_result: dict) -> None:
     if db is not None:
         try:
             db.forecasts.update_one(
-                {"base_date": base_date},
+                {"week_key": week_key},
                 {"$setOnInsert": entry},
-                upsert=True,   # Insert only if base_date not already present
+                upsert=True,   # Insert only if this week not already logged
             )
-            log.info(f"Forecast logged to MongoDB for {base_date}")
+            log.info(f"Forecast logged to MongoDB — week {week_key} (base: {base_date})")
             return
         except Exception as e:
             log.warning(f"MongoDB forecast write failed, falling back to file: {e}")
@@ -743,13 +798,13 @@ def _log_forecast(forecast_result: dict) -> None:
         if os.path.exists(FORECAST_LOG_PATH):
             with open(FORECAST_LOG_PATH) as f:
                 entries = json.load(f)
-        existing = {e["base_date"] for e in entries}
-        if base_date not in existing:
-            entries = (entries + [entry])[-60:]
+        existing_weeks = {e.get("week_key") for e in entries}
+        if week_key not in existing_weeks:
+            entries = (entries + [entry])[-52:]   # Keep ~1 year
             os.makedirs(MODELS_DIR, exist_ok=True)
             with open(FORECAST_LOG_PATH, "w") as f:
                 json.dump(entries, f, indent=2)
-            log.info(f"Forecast logged to file (fallback) for {base_date}")
+            log.info(f"Forecast logged to file (fallback) — week {week_key}")
     except Exception as e:
         log.warning(f"Forecast file fallback also failed: {e}")
 
@@ -830,6 +885,14 @@ def _safe(val) -> Optional[float]:
 # ================================================================
 # ENDPOINTS
 # ================================================================
+
+# ── / ────────────────────────────────────────────────────────────
+
+@app.get("/", tags=["System"], include_in_schema=False)
+async def root():
+    """Redirect root URL to interactive API docs."""
+    return RedirectResponse(url="/docs")
+
 
 # ── /health ──────────────────────────────────────────────────────
 
@@ -1058,93 +1121,121 @@ async def get_indicators():
 @app.get("/api/accuracy", tags=["Forecast"])
 async def get_accuracy():
     """
-    Compares past forecasts against actual prices.
-    Reads the forecast log written by /api/forecast, fetches actual
-    prices from Stooq, and returns per-day accuracy results.
-    Returns up to 30 evaluated forecast days.
+    Weekly forecast accuracy tracker.
+
+    For each logged week, checks whether all 7 predicted days now have
+    actual prices available from Stooq. Only returns COMPLETE weeks
+    where every day can be evaluated — no pending rows shown.
+
+    Weekly cycle:
+      Monday  → forecast logged for the week
+      Following Monday → all 7 actuals available → week evaluated + shown
     """
     entries = _load_forecasts()
     if not entries:
         return {
-            "results"           : [],
-            "directional_acc"   : None,
-            "mae"               : None,
-            "total_evaluated"   : 0,
-            "message"           : "No forecast history yet. "
-                                  "Accuracy data builds up over time.",
+            "weeks"           : [],
+            "results"         : [],
+            "directional_acc" : None,
+            "mae"             : None,
+            "total_evaluated" : 0,
+            "message"         : "No forecast history yet — results appear "
+                                "one week after the first forecast is generated.",
         }
 
-    # Fetch enough history to cover all logged forecast dates
+    # Fetch actual prices
     df = fetch_sgln_data(years=2)
-    actual_prices = {str(d.date()): row["close"]
-                     for d, row in df.iterrows()}
+    actual_prices = {str(d.date()): row["close"] for d, row in df.iterrows()}
 
-    results    = []
-    correct    = 0
-    total_err  = 0.0
-    evaluated  = 0
+    all_results  = []   # Flat list of day rows for the table
+    weeks_meta   = []   # One summary per completed week
+    total_correct = 0
+    total_err     = 0.0
+    total_days    = 0
 
-    for entry in reversed(entries):   # Most recent first
-        base_close = entry.get("last_close")
+    # Process most recent weeks first
+    for entry in reversed(entries):
+        base_close  = entry.get("last_close")
+        week_key    = entry.get("week_key", entry.get("base_date", ""))
+        base_date   = entry.get("base_date", "")
+        predictions = entry.get("predictions", [])
 
-        for pred in entry.get("predictions", []):
-            target_date = pred["date"]
-            predicted   = pred["ensemble"]
-            actual      = actual_prices.get(target_date)
+        # ── Check if ALL 7 days have actuals ─────────────────
+        day_results = []
+        week_complete = True
 
+        prev_close = base_close
+        for pred in predictions:
+            actual = actual_prices.get(pred["date"])
             if actual is None:
-                # Future date — not yet available
-                results.append({
-                    "date"          : target_date,
-                    "predicted"     : predicted,
-                    "actual"        : None,
-                    "error"         : None,
-                    "pred_direction": pred["direction"],
-                    "act_direction" : None,
-                    "correct"       : None,
-                    "confidence"    : pred["confidence"],
-                    "status"        : "pending",
-                })
-                continue
+                week_complete = False
+                break
 
-            # Compute result
-            error        = round(actual - predicted, 4)
-            abs_err      = abs(error)
-            pred_dir     = pred["direction"]
-            act_dir      = "UP" if actual > base_close else "DOWN"
-            is_correct   = pred_dir == act_dir
+            error      = round(actual - pred["ensemble"], 4)
+            act_dir    = "UP" if actual > prev_close else "DOWN"
+            is_correct = pred["direction"] == act_dir
 
-            if is_correct:
-                correct += 1
-            total_err += abs_err
-            evaluated += 1
-
-            results.append({
-                "date"          : target_date,
-                "predicted"     : predicted,
+            day_results.append({
+                "date"          : pred["date"],
+                "week_key"      : week_key,
+                "predicted"     : pred["ensemble"],
                 "actual"        : round(actual, 4),
                 "error"         : error,
-                "pred_direction": pred_dir,
+                "pred_direction": pred["direction"],
                 "act_direction" : act_dir,
                 "correct"       : is_correct,
                 "confidence"    : pred["confidence"],
                 "status"        : "evaluated",
             })
+            prev_close = actual
 
-            base_close = actual   # Roll forward for next day's direction
+        # ── Skip incomplete weeks entirely ────────────────────
+        if not week_complete or not day_results:
+            continue
 
-        if len(results) >= 30:
+        # ── Week is complete — compute summary ────────────────
+        week_correct = sum(1 for r in day_results if r["correct"])
+        week_mae     = round(sum(abs(r["error"]) for r in day_results) / len(day_results), 4)
+        week_da      = round(week_correct / len(day_results) * 100, 1)
+
+        weeks_meta.append({
+            "week_key"   : week_key,
+            "base_date"  : base_date,
+            "days"       : len(day_results),
+            "correct"    : week_correct,
+            "da_pct"     : week_da,
+            "mae"        : week_mae,
+        })
+
+        all_results.extend(day_results)
+        total_correct += week_correct
+        total_err     += sum(abs(r["error"]) for r in day_results)
+        total_days    += len(day_results)
+
+        # Keep up to 8 weeks (56 days) of history
+        if len(weeks_meta) >= 8:
             break
 
-    da  = round((correct / evaluated * 100), 1) if evaluated > 0 else None
-    mae = round(total_err / evaluated, 4)        if evaluated > 0 else None
+    if total_days == 0:
+        return {
+            "weeks"           : [],
+            "results"         : [],
+            "directional_acc" : None,
+            "mae"             : None,
+            "total_evaluated" : 0,
+            "message"         : "No complete weeks yet — check back next week.",
+        }
+
+    overall_da  = round(total_correct / total_days * 100, 1)
+    overall_mae = round(total_err / total_days, 4)
 
     return {
-        "results"           : results,
-        "directional_acc"   : da,
-        "mae"               : mae,
-        "total_evaluated"   : evaluated,
-        "total_pending"     : sum(1 for r in results if r["status"] == "pending"),
+        "weeks"           : weeks_meta,
+        "results"         : all_results,
+        "directional_acc" : overall_da,
+        "mae"             : overall_mae,
+        "total_evaluated" : total_days,
+        "total_weeks"     : len(weeks_meta),
     }
 
 

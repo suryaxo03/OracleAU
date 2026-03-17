@@ -1,7 +1,12 @@
 /* ================================================================
-   CONFIG — point this at your API
+   CONFIG
+   ─────
+   LOCAL DEV:  Keep the localhost line active, comment out Render
+   DEPLOY:     Comment out localhost, uncomment the Render line
 ================================================================ */
-const API_BASE = 'https://oracleau.onrender.com';
+
+const API_BASE = 'http://localhost:8000';       // ← LOCAL (active)
+// const API_BASE = 'https://oracleau.onrender.com'; // ← DEPLOY (comment out above, uncomment this)
 
 /* ================================================================
    STATE
@@ -365,7 +370,7 @@ async function loadIndicators() {
 }
 
 /* ================================================================
-   ACCURACY TRACKER — fetched live from /api/accuracy
+   ACCURACY TRACKER — weekly batches from /api/accuracy
 ================================================================ */
 async function loadAccuracy() {
   const tbody = $('accuracy-tbody');
@@ -381,71 +386,96 @@ async function loadAccuracy() {
     if (d.directional_acc !== null) {
       $('acc-live-da').textContent = d.directional_acc + '%';
       $('acc-live-da').parentElement.querySelector('.acc-tile-sub').textContent =
-        `${d.total_evaluated} evaluated`;
+        `${d.total_evaluated} days · ${d.total_weeks || 0} weeks`;
     }
     if (d.mae !== null) {
       $('acc-mae').textContent = '£' + fmt(d.mae, 4);
     }
 
-    // ── No data yet ───────────────────────────────────────────
+    // ── No complete weeks yet ─────────────────────────────────
     if (!d.results || d.results.length === 0) {
       tbody.innerHTML = `
-        <tr><td colspan="6" style="text-align:center;color:var(--text-muted);padding:24px">
-          No forecast history yet — accuracy data builds automatically over time.
+        <tr><td colspan="6" style="text-align:center;color:var(--text-muted);padding:28px;line-height:1.8">
+          No completed weeks yet.<br>
+          <span style="font-size:11px">Results appear the Monday after each 7-day forecast window closes.</span>
         </td></tr>`;
       return;
     }
 
-    // ── Table rows ────────────────────────────────────────────
+    // ── Render rows grouped by week ───────────────────────────
     tbody.innerHTML = '';
     track.innerHTML = '';
 
-    // Show most recent 10 evaluated days at top, then pending
-    const evaluated = d.results.filter(r => r.status === 'evaluated').slice(0, 10);
-    const pending   = d.results.filter(r => r.status === 'pending').slice(0, 3);
-    const rows      = [...evaluated, ...pending];
-
-    rows.forEach(row => {
-      if (row.status === 'pending') {
-        tbody.innerHTML += `
-          <tr style="opacity:0.5">
-            <td style="color:var(--text-secondary)">${fmtDate(row.date)}</td>
-            <td style="text-align:right" class="acc-col-predicted">£${fmt(row.predicted, 4)}</td>
-            <td style="text-align:right;color:var(--text-muted)">Pending</td>
-            <td style="text-align:right" class="acc-col-error td-change">—</td>
-            <td style="text-align:right">
-              <span style="color:var(--text-muted)">${row.pred_direction}</span>
-            </td>
-            <td style="text-align:right">
-              <span class="result-pill pending">Pending</span>
-            </td>
-          </tr>`;
-        track.innerHTML += `<div class="acc-bar pending" title="${row.date}">?</div>`;
-        return;
+    // Group results by week_key, preserving order
+    const weekGroups = {};
+    const weekOrder  = [];
+    d.results.forEach(row => {
+      const wk = row.week_key || 'unknown';
+      if (!weekGroups[wk]) {
+        weekGroups[wk] = [];
+        weekOrder.push(wk);
       }
+      weekGroups[wk].push(row);
+    });
 
-      const err       = row.error || 0;
-      const errCls    = err >= 0 ? 'up' : 'down';
-      const isCorrect = row.correct;
-      const resultCls = isCorrect ? 'correct' : 'miss';
-      const actDir    = row.act_direction || '—';
+    weekOrder.forEach(wk => {
+      const rows      = weekGroups[wk];
+      const wCorrect  = rows.filter(r => r.correct).length;
+      const wTotal    = rows.length;
+      const wDA       = Math.round(wCorrect / wTotal * 100);
+      const wMAE      = (rows.reduce((s, r) => s + Math.abs(r.error || 0), 0) / wTotal).toFixed(2);
 
+      // ── Week header row ───────────────────────────────────
       tbody.innerHTML += `
         <tr>
-          <td style="color:var(--text-secondary)">${fmtDate(row.date)}</td>
-          <td style="text-align:right" class="acc-col-predicted">£${fmt(row.predicted, 4)}</td>
-          <td style="text-align:right;color:var(--text-primary)">£${fmt(row.actual, 4)}</td>
-          <td style="text-align:right" class="td-change acc-col-error ${errCls}">${err >= 0 ? '+' : ''}${fmt(err, 4)}</td>
-          <td style="text-align:right">
-            <span style="color:${actDir === 'UP' ? 'var(--up)' : 'var(--down)'}">
-              ${actDir === 'UP' ? '▲' : '▼'} ${actDir}
+          <td colspan="6" style="
+            padding: 10px 12px 6px;
+            background: rgba(201,168,76,0.04);
+            border-bottom: 1px solid var(--panel-border);
+            border-top: 1px solid var(--panel-border);
+          ">
+            <span style="font-family:var(--font-display);font-size:9px;letter-spacing:0.15em;
+                         text-transform:uppercase;color:var(--gold-dim)">
+              Week of ${fmtDate(rows[0].date)}
+            </span>
+            <span style="float:right;font-size:10px;color:var(--text-muted)">
+              ${wCorrect}/${wTotal} correct &nbsp;·&nbsp;
+              <span style="color:${wDA >= 70 ? 'var(--up)' : wDA >= 50 ? 'var(--gold)' : 'var(--down)'}">
+                ${wDA}% DA
+              </span>
+              &nbsp;·&nbsp; MAE £${wMAE}
             </span>
           </td>
-          <td style="text-align:right">
-            <span class="result-pill ${resultCls}">${isCorrect ? '✓ Correct' : '✗ Miss'}</span>
-          </td>
         </tr>`;
-      track.innerHTML += `<div class="acc-bar ${resultCls}" title="${row.date}">${isCorrect ? '✓' : '✗'}</div>`;
+
+      // ── Day rows for this week ────────────────────────────
+      rows.forEach(row => {
+        const err       = row.error || 0;
+        const errCls    = err >= 0 ? 'up' : 'down';
+        const isCorrect = row.correct;
+        const resultCls = isCorrect ? 'correct' : 'miss';
+        const actDir    = row.act_direction || '—';
+
+        tbody.innerHTML += `
+          <tr>
+            <td style="color:var(--text-secondary);padding-left:20px">${fmtDate(row.date)}</td>
+            <td style="text-align:right" class="acc-col-predicted">£${fmt(row.predicted, 4)}</td>
+            <td style="text-align:right;color:var(--text-primary)">£${fmt(row.actual, 4)}</td>
+            <td style="text-align:right" class="td-change acc-col-error ${errCls}">
+              ${err >= 0 ? '+' : ''}${fmt(err, 4)}
+            </td>
+            <td style="text-align:right">
+              <span style="color:${actDir === 'UP' ? 'var(--up)' : 'var(--down)'}">
+                ${actDir === 'UP' ? '▲' : '▼'} ${actDir}
+              </span>
+            </td>
+            <td style="text-align:right">
+              <span class="result-pill ${resultCls}">${isCorrect ? '✓ Correct' : '✗ Miss'}</span>
+            </td>
+          </tr>`;
+
+        track.innerHTML += `<div class="acc-bar ${resultCls}" title="${fmtDate(row.date)}">${isCorrect ? '✓' : '✗'}</div>`;
+      });
     });
 
   } catch(e) {
