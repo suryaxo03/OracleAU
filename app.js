@@ -5,8 +5,8 @@
    DEPLOY:     Comment out localhost, uncomment the Render line
 ================================================================ */
 
-const API_BASE = 'http://localhost:8000';       // ← LOCAL (active)
-// const API_BASE = 'https://oracleau.onrender.com'; // ← DEPLOY (comment out above, uncomment this)
+// const API_BASE = 'http://localhost:8000';       // ← LOCAL (active)
+const API_BASE = 'https://oracleau.onrender.com'; // ← DEPLOY (comment out above, uncomment this)
 
 /* ================================================================
    STATE
